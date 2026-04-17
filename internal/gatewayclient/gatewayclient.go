@@ -138,37 +138,95 @@ func (c *GatewayClient) CallAgent(ctx context.Context, input interface{}, sessio
 		return nil, fmt.Errorf("failed to send agent request: %w", err)
 	}
 
-	// Read response
-	_, rawMsg, err = gw.ReadMessage()
+	// Read response - should be accepted (async agent)
+	initialResp, err := c.readMatchingResponse(gw, "agent-1")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-	fmt.Printf("[Gateway] CallAgent raw response: %s\n", string(rawMsg))
-
-	// Parse as generic map to see actual structure
-	var rawResp map[string]interface{}
-	if err := json.Unmarshal(rawMsg, &rawResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, err
 	}
 
-	// Check for error field
-	if errVal, hasError := rawResp["error"]; hasError && errVal != nil {
-		return nil, fmt.Errorf("agent error: %v", errVal)
+	// Extract runId from accepted response
+	initialMap, ok := initialResp.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected agent response type: %T", initialResp)
 	}
 
-	// Extract result - could be in "result" field or directly in response
-	result, hasResult := rawResp["result"]
-	if !hasResult {
-		delete(rawResp, "error")
-		if len(rawResp) > 0 {
-			result = rawResp
-		} else {
-			result = nil
-		}
+	payload, ok := initialMap["payload"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("missing payload in agent response")
+	}
+
+	runId, ok := payload["runId"].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing runId in agent response: %v", payload)
+	}
+
+	status, _ := payload["status"].(string)
+	fmt.Printf("[Gateway] CallAgent accepted, runId=%s, status=%s\n", runId, status)
+
+	// Poll agent.wait until the task completes
+	result, err := c.waitForAgentResult(gw, runId)
+	if err != nil {
+		return nil, err
 	}
 
 	fmt.Printf("[Gateway] CallAgent result extracted: %v\n", result)
 	return result, nil
+}
+
+// waitForAgentResult polls agent.wait until the task completes or times out
+func (c *GatewayClient) waitForAgentResult(gw *ws.Conn, runId string) (interface{}, error) {
+	waitReq := map[string]interface{}{
+		"type":   "req",
+		"id":     "wait-1",
+		"method": "agent.wait",
+		"params": map[string]interface{}{
+			"runId":     runId,
+			"timeoutMs": 60000,
+		},
+	}
+
+	waitJSON, _ := json.MarshalIndent(waitReq, "", "  ")
+	fmt.Printf("[Gateway] waitForAgentResult sending: %s\n", string(waitJSON))
+
+	if err := gw.WriteJSON(waitReq); err != nil {
+		return nil, fmt.Errorf("failed to send agent.wait: %w", err)
+	}
+
+	// Read response
+	resp, err := c.readMatchingResponse(gw, "wait-1")
+	if err != nil {
+		return nil, err
+	}
+
+	respMap, ok := resp.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected wait response type: %T", resp)
+	}
+
+	respPayload, ok := respMap["payload"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("missing payload in agent.wait response")
+	}
+
+	status, _ := respPayload["status"].(string)
+	fmt.Printf("[Gateway] waitForAgentResult status: %s\n", status)
+
+	// If completed, return the result
+	if status == "completed" {
+		if result, ok := respPayload["result"]; ok {
+			return result, nil
+		}
+		// Some completed responses put result at the top level of payload
+		delete(respPayload, "status")
+		return respPayload, nil
+	}
+
+	// If still running, poll again
+	if status == "running" || status == "accepted" {
+		return c.waitForAgentResult(gw, runId)
+	}
+
+	return respPayload, nil
 }
 
 // transformToAgentParams transforms Hub input format to Gateway agent format
@@ -368,34 +426,10 @@ func (c *GatewayClient) InvokeNode(ctx context.Context, input interface{}) (inte
 		return nil, fmt.Errorf("failed to send invoke request: %w", err)
 	}
 
-	// Read response
-	_, rawMsg, err = gw.ReadMessage()
+	// Read response - must match by id and type to get the correct response
+	result, err := c.readMatchingResponse(gw, "invoke-1")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-	fmt.Printf("[Gateway] InvokeNode raw response: %s\n", string(rawMsg))
-
-	// Parse as generic map to see actual structure
-	var rawResp map[string]interface{}
-	if err := json.Unmarshal(rawMsg, &rawResp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	// Check for error field
-	if errVal, hasError := rawResp["error"]; hasError && errVal != nil {
-		return nil, fmt.Errorf("node.invoke error: %v", errVal)
-	}
-
-	// Extract result - could be in "result" field or directly in response
-	result, hasResult := rawResp["result"]
-	if !hasResult {
-		// Maybe the whole response IS the result?
-		delete(rawResp, "error")
-		if len(rawResp) > 0 {
-			result = rawResp
-		} else {
-			result = nil
-		}
+		return nil, err
 	}
 
 	fmt.Printf("[Gateway] InvokeNode result extracted: %v\n", result)
@@ -420,8 +454,10 @@ func convertToGatewayParams(input interface{}) map[string]interface{} {
 	// Convert "node" to nodeId + command if present
 	if node, ok := inputMap["node"].(string); ok {
 		parts := strings.SplitN(node, ".", 2)
-		if len(parts) == 2 {
+		if len(parts) >= 1 {
 			result["nodeId"] = parts[0]
+		}
+		if len(parts) == 2 {
 			result["command"] = parts[1]
 		}
 	}
@@ -431,6 +467,9 @@ func convertToGatewayParams(input interface{}) map[string]interface{} {
 		result["params"] = params
 	}
 
+	// Add idempotencyKey for the Gateway
+	result["idempotencyKey"] = fmt.Sprintf("invoke-%d", time.Now().UnixNano())
+
 	// Copy over any other fields that aren't node or params
 	for k, v := range inputMap {
 		if k != "node" && k != "params" {
@@ -439,6 +478,53 @@ func convertToGatewayParams(input interface{}) map[string]interface{} {
 	}
 
 	return result
+}
+
+// readMatchingResponse reads WebSocket messages until it finds a response matching the given request ID.
+// It ignores event messages (like health events) that arrive before the actual response.
+func (c *GatewayClient) readMatchingResponse(gw *ws.Conn, requestID string) (interface{}, error) {
+	for {
+		_, rawMsg, err := gw.ReadMessage()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %w", err)
+		}
+
+		fmt.Printf("[Gateway] readMatchingResponse received: %s\n", string(rawMsg))
+
+		var msg map[string]interface{}
+		if err := json.Unmarshal(rawMsg, &msg); err != nil {
+			return nil, fmt.Errorf("failed to parse response: %w", err)
+		}
+
+		msgType, _ := msg["type"].(string)
+		msgID, _ := msg["id"].(string)
+
+		// Skip event messages (like health) - they don't have matching id
+		if msgType == "event" {
+			fmt.Printf("[Gateway] readMatchingResponse skipping event: %v\n", msg["event"])
+			continue
+		}
+
+		// Check if this is a response for our request
+		if msgType == "res" && msgID == requestID {
+			// Check for error field
+			if errVal, hasError := msg["error"]; hasError && errVal != nil {
+				return nil, fmt.Errorf("gateway error: %v", errVal)
+			}
+
+			// Extract result
+			if result, hasResult := msg["result"]; hasResult {
+				return result, nil
+			}
+			// If no result field but no error, return the whole response
+			delete(msg, "type")
+			delete(msg, "id")
+			return msg, nil
+		}
+
+		// Not our response, keep reading
+		fmt.Printf("[Gateway] readMatchingResponse: got unexpected msg type=%s id=%s, continue\n", msgType, msgID)
+	}
 }
 
 // NormalizeNodeArtifacts extracts artifacts from node.invoke result

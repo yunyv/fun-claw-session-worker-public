@@ -101,6 +101,19 @@ func handleTask(hub *hubclient.HubClient, gateway *gatewayclient.GatewayClient, 
 	artifacts := []protocol.ArtifactDescriptor{}
 
 	switch task.Action {
+	case protocol.TaskActionResponsesCreate:
+		// Backward compatibility: responses.create -> agent
+		fmt.Printf("[Worker] Executing responses.create (mapped to agent) for request_id=%s\n", task.RequestID)
+		inputJSON, _ := json.MarshalIndent(task.Input, "", "  ")
+		fmt.Printf("[Worker] DEBUG: input=%s\n", string(inputJSON))
+		res, err := gateway.CallAgent(ctx, task.Input, task.OpenclawSessionKey)
+		if err != nil {
+			fmt.Printf("[Worker] ERROR: responses.create failed: %v\n", err)
+			return sendFailed(hub, task.RequestID, err)
+		}
+		result = res
+		fmt.Printf("[Worker] responses.create completed for request_id=%s\n", task.RequestID)
+
 	case protocol.TaskActionAgent:
 		fmt.Printf("[Worker] Executing agent for request_id=%s\n", task.RequestID)
 		// Debug: print input structure
