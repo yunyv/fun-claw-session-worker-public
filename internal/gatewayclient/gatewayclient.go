@@ -2,12 +2,14 @@ package gatewayclient
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/funclaw/go-worker/internal/protocol"
 	ws "github.com/gorilla/websocket"
@@ -17,10 +19,14 @@ const (
 	operatorReadScope  = "operator.read"
 	operatorWriteScope = "operator.write"
 	gatewayDialTimeout = 10 * time.Second
-	invokeTimeout      = 30 * time.Second
 )
 
-// GatewayClient is a client for calling OpenClaw Gateway
+// GatewayClient is a client for calling OpenClaw Gateway.
+//
+// 这里的关键点：
+// 1. responses.create 现在走 Gateway 的 WS `agent`，不是旧的 /v1/responses。
+// 2. Gateway WS 会夹杂 health/tick 等 event，所以必须按 req id 等待真正的 res。
+// 3. responses.create 的输入要转换成 agent 所需的 message + attachments。
 type GatewayClient struct {
 	baseURL    string
 	token      string
@@ -28,7 +34,7 @@ type GatewayClient struct {
 	wsURL      string
 }
 
-// New creates a new Gateway client
+// New creates a new Gateway client.
 func New(baseURL, token, wsURL string) *GatewayClient {
 	return &GatewayClient{
 		baseURL: baseURL,
@@ -40,90 +46,27 @@ func New(baseURL, token, wsURL string) *GatewayClient {
 	}
 }
 
-// CallAgent calls the agent method via WebSocket on Gateway
+// CallAgent calls the agent method via WebSocket on Gateway.
 func (c *GatewayClient) CallAgent(ctx context.Context, input interface{}, sessionKey string) (interface{}, error) {
 	fmt.Printf("[Gateway] CallAgent called with sessionKey=%s\n", sessionKey)
 
 	inputJSON, _ := json.MarshalIndent(input, "", "  ")
 	fmt.Printf("[Gateway] CallAgent input: %s\n", string(inputJSON))
 
-	dialCtx, cancel := context.WithTimeout(ctx, gatewayDialTimeout)
-	defer cancel()
-
-	gw, _, err := ws.DefaultDialer.DialContext(dialCtx, c.wsURL, nil)
+	baselineSeq, err := c.getLatestHistorySeq(ctx, sessionKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial gateway ws: %w", err)
+		// 历史基线拿不到不阻断主流程，后面再回退。
+		fmt.Printf("[Gateway] CallAgent baseline history lookup failed, continue without baseline: %v\n", err)
+		baselineSeq = 0
+	}
+
+	gw, err := c.connectOperatorSocket(ctx)
+	if err != nil {
+		return nil, err
 	}
 	defer gw.Close()
 
-	// Read first message - should be connect.challenge
-	_, rawMsg, err := gw.ReadMessage()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read challenge: %w", err)
-	}
-	fmt.Printf("[Gateway] CallAgent first message: %s\n", string(rawMsg))
-
-	var challenge map[string]interface{}
-	if err := json.Unmarshal(rawMsg, &challenge); err != nil {
-		return nil, fmt.Errorf("failed to parse challenge: %w", err)
-	}
-
-	// Handle connect.challenge
-	if challengeType, ok := challenge["type"].(string); ok && challengeType == "event" {
-		if event, ok := challenge["event"].(string); ok && event == "connect.challenge" {
-			fmt.Printf("[Gateway] Received connect.challenge\n")
-
-			connectResp := map[string]interface{}{
-				"type":   "req",
-				"id":     "connect-1",
-				"method": "connect",
-				"params": map[string]interface{}{
-					"minProtocol": 3,
-					"maxProtocol": 3,
-					"client": map[string]interface{}{
-						"id":       "cli",
-						"version":  "1.0.0",
-						"platform": "linux",
-						"mode":     "cli",
-					},
-					"role":   "operator",
-					"auth":   map[string]interface{}{"token": c.token},
-					"scopes": []string{"operator.read", "operator.write"},
-				},
-			}
-
-			fmt.Printf("[Gateway] Sending connect\n")
-			if err := gw.WriteJSON(connectResp); err != nil {
-				return nil, fmt.Errorf("failed to send connect: %w", err)
-			}
-
-			// Read response
-			_, rawMsg, err = gw.ReadMessage()
-			if err != nil {
-				return nil, fmt.Errorf("failed to read connect response: %w", err)
-			}
-			fmt.Printf("[Gateway] Connect response: %s\n", string(rawMsg))
-
-			var resp map[string]interface{}
-			json.Unmarshal(rawMsg, &resp)
-
-			if ok, hasOK := resp["ok"].(bool); !hasOK || !ok {
-				errMsg := "connect failed"
-				if errVal, hasErr := resp["error"].(map[string]interface{}); hasErr {
-					if msg, hasMsg := errVal["message"].(string); hasMsg {
-						errMsg = msg
-					}
-				}
-				return nil, fmt.Errorf("[Gateway] %s", errMsg)
-			}
-			fmt.Printf("[Gateway] Connect succeeded!\n")
-		}
-	}
-
-	// Transform input to agent format
 	agentParams := transformToAgentParams(input, sessionKey)
-
-	// Now send the agent request
 	reqPayload := map[string]interface{}{
 		"type":   "req",
 		"id":     "agent-1",
@@ -138,141 +81,85 @@ func (c *GatewayClient) CallAgent(ctx context.Context, input interface{}, sessio
 		return nil, fmt.Errorf("failed to send agent request: %w", err)
 	}
 
-	// Read response - should be accepted (async agent)
 	initialResp, err := c.readMatchingResponse(gw, "agent-1")
 	if err != nil {
 		return nil, err
 	}
-
-	// Extract runId from accepted response
-	initialMap, ok := initialResp.(map[string]interface{})
+	payload, ok := extractPayloadMap(initialResp)
 	if !ok {
-		return nil, fmt.Errorf("unexpected agent response type: %T", initialResp)
+		return nil, fmt.Errorf("missing payload in agent response: %v", initialResp)
 	}
 
-	payload, ok := initialMap["payload"].(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("missing payload in agent response")
-	}
-
-	runId, ok := payload["runId"].(string)
+	runID, ok := payload["runId"].(string)
 	if !ok {
 		return nil, fmt.Errorf("missing runId in agent response: %v", payload)
 	}
-
 	status, _ := payload["status"].(string)
-	fmt.Printf("[Gateway] CallAgent accepted, runId=%s, status=%s\n", runId, status)
+	fmt.Printf("[Gateway] CallAgent accepted, runId=%s, status=%s\n", runID, status)
 
-	// Poll agent.wait until the task completes
-	result, err := c.waitForAgentResult(gw, runId)
+	waitPayload, err := c.waitForAgentCompletion(gw, runID)
 	if err != nil {
 		return nil, err
 	}
 
-	fmt.Printf("[Gateway] CallAgent result extracted: %v\n", result)
-	return result, nil
-}
-
-// waitForAgentResult polls agent.wait until the task completes or times out
-func (c *GatewayClient) waitForAgentResult(gw *ws.Conn, runId string) (interface{}, error) {
-	waitReq := map[string]interface{}{
-		"type":   "req",
-		"id":     "wait-1",
-		"method": "agent.wait",
-		"params": map[string]interface{}{
-			"runId":     runId,
-			"timeoutMs": 60000,
-		},
-	}
-
-	waitJSON, _ := json.MarshalIndent(waitReq, "", "  ")
-	fmt.Printf("[Gateway] waitForAgentResult sending: %s\n", string(waitJSON))
-
-	if err := gw.WriteJSON(waitReq); err != nil {
-		return nil, fmt.Errorf("failed to send agent.wait: %w", err)
-	}
-
-	// Read response
-	resp, err := c.readMatchingResponse(gw, "wait-1")
-	if err != nil {
-		return nil, err
-	}
-
-	respMap, ok := resp.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("unexpected wait response type: %T", resp)
-	}
-
-	respPayload, ok := respMap["payload"].(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("missing payload in agent.wait response")
-	}
-
-	status, _ := respPayload["status"].(string)
-	fmt.Printf("[Gateway] waitForAgentResult status: %s\n", status)
-
-	// If completed, return the result
-	if status == "completed" {
-		if result, ok := respPayload["result"]; ok {
-			return result, nil
-		}
-		// Some completed responses put result at the top level of payload
-		delete(respPayload, "status")
-		return respPayload, nil
-	}
-
-	// If still running, poll again
-	if status == "running" || status == "accepted" {
-		return c.waitForAgentResult(gw, runId)
-	}
-
-	return respPayload, nil
-}
-
-// transformToAgentParams transforms Hub input format to Gateway agent format
-func transformToAgentParams(input interface{}, sessionKey string) map[string]interface{} {
-	result := make(map[string]interface{})
-
-	// Set sessionId if provided
+	// agent.wait 只给状态，不给最终文本；真正结果从 session history 里补回。
 	if sessionKey != "" {
-		result["sessionId"] = sessionKey
-	}
-
-	// Generate idempotencyKey
-	result["idempotencyKey"] = fmt.Sprintf("agent-%d", time.Now().UnixNano())
-
-	// Initialize attachments as empty array
-	result["attachments"] = []interface{}{}
-
-	switch v := input.(type) {
-	case string:
-		result["message"] = v
-	case map[string]interface{}:
-		// Look for common message field names
-		if msg, ok := v["message"].(string); ok {
-			result["message"] = msg
-		} else if text, ok := v["text"].(string); ok {
-			result["message"] = text
-		} else if inp, ok := v["input"].(string); ok {
-			result["message"] = inp
-		} else {
-			// Pass through as message if it's a map
-			result["message"] = fmt.Sprintf("%v", v)
+		historyResult, historyErr := c.buildAgentResultFromHistory(ctx, sessionKey, baselineSeq)
+		if historyErr == nil {
+			fmt.Printf("[Gateway] CallAgent history-derived result extracted: %v\n", historyResult)
+			return historyResult, nil
 		}
-	default:
-		result["message"] = fmt.Sprintf("%v", input)
+		fmt.Printf("[Gateway] CallAgent history-derived result failed, fallback to wait payload: %v\n", historyErr)
 	}
 
-	return result
+	fmt.Printf("[Gateway] CallAgent wait payload fallback: %v\n", waitPayload)
+	return waitPayload, nil
 }
 
-// GetSessionHistory calls GET /sessions/{sessionKey}/history on Gateway
+func (c *GatewayClient) waitForAgentCompletion(gw *ws.Conn, runID string) (map[string]interface{}, error) {
+	for {
+		waitRequestID := fmt.Sprintf("wait-%d", time.Now().UnixNano())
+		waitReq := map[string]interface{}{
+			"type":   "req",
+			"id":     waitRequestID,
+			"method": "agent.wait",
+			"params": map[string]interface{}{
+				"runId":     runID,
+				"timeoutMs": 60000,
+			},
+		}
+
+		waitJSON, _ := json.MarshalIndent(waitReq, "", "  ")
+		fmt.Printf("[Gateway] waitForAgentCompletion sending: %s\n", string(waitJSON))
+
+		if err := gw.WriteJSON(waitReq); err != nil {
+			return nil, fmt.Errorf("failed to send agent.wait: %w", err)
+		}
+
+		resp, err := c.readMatchingResponse(gw, waitRequestID)
+		if err != nil {
+			return nil, err
+		}
+
+		payload, ok := extractPayloadMap(resp)
+		if !ok {
+			return nil, fmt.Errorf("missing payload in agent.wait response: %v", resp)
+		}
+
+		status, _ := payload["status"].(string)
+		fmt.Printf("[Gateway] waitForAgentCompletion status: %s\n", status)
+		if status == "running" || status == "accepted" {
+			continue
+		}
+		return payload, nil
+	}
+}
+
+// GetSessionHistory calls GET /sessions/{sessionKey}/history on Gateway.
 func (c *GatewayClient) GetSessionHistory(ctx context.Context, sessionKey string, query map[string]interface{}) (interface{}, error) {
 	fmt.Printf("[Gateway] GetSessionHistory called with sessionKey=%s\n", sessionKey)
 
 	url := c.baseURL + "/sessions/" + encodeURIComponent(sessionKey) + "/history"
-
-	// Add query params
 	if len(query) > 0 {
 		params := ""
 		for k, v := range query {
@@ -296,7 +183,6 @@ func (c *GatewayClient) GetSessionHistory(ctx context.Context, sessionKey string
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-
 	c.setReadHeaders(req, sessionKey)
 
 	resp, err := c.httpClient.Do(req)
@@ -319,99 +205,21 @@ func (c *GatewayClient) GetSessionHistory(ctx context.Context, sessionKey string
 	return result, nil
 }
 
-// InvokeNode calls node.invoke via WebSocket on Gateway
+// InvokeNode calls node.invoke via WebSocket on Gateway.
 func (c *GatewayClient) InvokeNode(ctx context.Context, input interface{}) (interface{}, error) {
 	fmt.Printf("[Gateway] InvokeNode called\n")
 
-	// Debug: print input params
 	inputJSON, _ := json.MarshalIndent(input, "", "  ")
 	fmt.Printf("[Gateway] InvokeNode params: %s\n", string(inputJSON))
 
-	// Convert Hub input format (node: "canvas.snapshot", idempotencyKey: "xxx")
-	// to Gateway format (nodeId: "canvas", command: "snapshot", idempotencyKey: "xxx")
 	invokeParams := convertToGatewayParams(input)
 
-	dialCtx, cancel := context.WithTimeout(ctx, gatewayDialTimeout)
-	defer cancel()
-
-	gw, _, err := ws.DefaultDialer.DialContext(dialCtx, c.wsURL, nil)
+	gw, err := c.connectOperatorSocket(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial gateway ws: %w", err)
+		return nil, err
 	}
 	defer gw.Close()
 
-	// Read first message - should be connect.challenge
-	_, rawMsg, err := gw.ReadMessage()
-	if err != nil {
-		return nil, fmt.Errorf("failed to read challenge: %w", err)
-	}
-	fmt.Printf("[Gateway] InvokeNode first message: %s\n", string(rawMsg))
-
-	var challenge map[string]interface{}
-	if err := json.Unmarshal(rawMsg, &challenge); err != nil {
-		return nil, fmt.Errorf("failed to parse challenge: %w", err)
-	}
-
-	// Handle connect.challenge
-	if challengeType, ok := challenge["type"].(string); ok && challengeType == "event" {
-		if event, ok := challenge["event"].(string); ok && event == "connect.challenge" {
-			fmt.Printf("[Gateway] Received connect.challenge\n")
-
-			// The correct connect params for OpenClaw Gateway (found via testing):
-			// - id: "cli"
-			// - mode: "cli"
-			// - role: "operator"
-			// - minProtocol/maxProtocol: 3
-			// - auth.token: gateway token
-			// - scopes: ["operator.read", "operator.write"]
-			connectResp := map[string]interface{}{
-				"type":   "req",
-				"id":     "connect-1",
-				"method": "connect",
-				"params": map[string]interface{}{
-					"minProtocol": 3,
-					"maxProtocol": 3,
-					"client": map[string]interface{}{
-						"id":       "cli",
-						"version":  "1.0.0",
-						"platform": "linux",
-						"mode":     "cli",
-					},
-					"role":   "operator",
-					"auth":   map[string]interface{}{"token": c.token},
-					"scopes": []string{"operator.read", "operator.write"},
-				},
-			}
-
-			fmt.Printf("[Gateway] Sending connect with id=cli, mode=cli, role=operator, protocol=3, scopes\n")
-			if err := gw.WriteJSON(connectResp); err != nil {
-				return nil, fmt.Errorf("failed to send connect: %w", err)
-			}
-
-			// Read response
-			_, rawMsg, err = gw.ReadMessage()
-			if err != nil {
-				return nil, fmt.Errorf("failed to read connect response: %w", err)
-			}
-			fmt.Printf("[Gateway] Connect response: %s\n", string(rawMsg))
-
-			var resp map[string]interface{}
-			json.Unmarshal(rawMsg, &resp)
-
-			if ok, hasOK := resp["ok"].(bool); !hasOK || !ok {
-				errMsg := "connect failed"
-				if errVal, hasErr := resp["error"].(map[string]interface{}); hasErr {
-					if msg, hasMsg := errVal["message"].(string); hasMsg {
-						errMsg = msg
-					}
-				}
-				return nil, fmt.Errorf("[Gateway] %s", errMsg)
-			}
-			fmt.Printf("[Gateway] Connect succeeded!\n")
-		}
-	}
-
-	// Now send the invoke request
 	reqPayload := map[string]interface{}{
 		"type":   "req",
 		"id":     "invoke-1",
@@ -426,32 +234,246 @@ func (c *GatewayClient) InvokeNode(ctx context.Context, input interface{}) (inte
 		return nil, fmt.Errorf("failed to send invoke request: %w", err)
 	}
 
-	// Read response - must match by id and type to get the correct response
-	result, err := c.readMatchingResponse(gw, "invoke-1")
+	resp, err := c.readMatchingResponse(gw, "invoke-1")
 	if err != nil {
 		return nil, err
 	}
 
-	fmt.Printf("[Gateway] InvokeNode result extracted: %v\n", result)
-	return result, nil
+	if payload, ok := extractPayloadMap(resp); ok {
+		fmt.Printf("[Gateway] InvokeNode payload extracted: %v\n", payload)
+		return payload, nil
+	}
+	if result, ok := resp["result"]; ok {
+		fmt.Printf("[Gateway] InvokeNode result extracted: %v\n", result)
+		return result, nil
+	}
+
+	fmt.Printf("[Gateway] InvokeNode raw frame fallback: %v\n", resp)
+	return resp, nil
 }
 
-// convertToGatewayParams converts Hub input format to Gateway format
-// Hub: {node: "canvas.snapshot", params: {arg1: "val1"}, timeoutMs: 30}
-// Gateway: {nodeId: "canvas", command: "snapshot", params: {arg1: "val1"}, timeoutMs: 30}
+func (c *GatewayClient) connectOperatorSocket(ctx context.Context) (*ws.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, gatewayDialTimeout)
+	defer cancel()
+
+	gw, _, err := ws.DefaultDialer.DialContext(dialCtx, c.wsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial gateway ws: %w", err)
+	}
+
+	_, rawMsg, err := gw.ReadMessage()
+	if err != nil {
+		gw.Close()
+		return nil, fmt.Errorf("failed to read challenge: %w", err)
+	}
+	fmt.Printf("[Gateway] connectOperatorSocket first message: %s\n", string(rawMsg))
+
+	var challenge map[string]interface{}
+	if err := json.Unmarshal(rawMsg, &challenge); err != nil {
+		gw.Close()
+		return nil, fmt.Errorf("failed to parse challenge: %w", err)
+	}
+	challengeType, _ := challenge["type"].(string)
+	eventName, _ := challenge["event"].(string)
+	if challengeType != "event" || eventName != "connect.challenge" {
+		gw.Close()
+		return nil, fmt.Errorf("unexpected gateway handshake frame: %v", challenge)
+	}
+
+	connectReq := map[string]interface{}{
+		"type":   "req",
+		"id":     "connect-1",
+		"method": "connect",
+		"params": map[string]interface{}{
+			"minProtocol": 3,
+			"maxProtocol": 3,
+			"client": map[string]interface{}{
+				"id":       "cli",
+				"version":  "1.0.0",
+				"platform": "linux",
+				"mode":     "cli",
+			},
+			"role":   "operator",
+			"auth":   map[string]interface{}{"token": c.token},
+			"scopes": []string{"operator.read", "operator.write"},
+		},
+	}
+
+	fmt.Printf("[Gateway] connectOperatorSocket sending connect\n")
+	if err := gw.WriteJSON(connectReq); err != nil {
+		gw.Close()
+		return nil, fmt.Errorf("failed to send connect: %w", err)
+	}
+
+	resp, err := c.readMatchingResponse(gw, "connect-1")
+	if err != nil {
+		gw.Close()
+		return nil, err
+	}
+	fmt.Printf("[Gateway] connectOperatorSocket connected: %v\n", resp)
+	return gw, nil
+}
+
+// transformToAgentParams transforms Hub input format to Gateway agent format.
+func transformToAgentParams(input interface{}, sessionKey string) map[string]interface{} {
+	result := make(map[string]interface{})
+	if sessionKey != "" {
+		result["sessionKey"] = sessionKey
+	}
+	result["idempotencyKey"] = fmt.Sprintf("agent-%d", time.Now().UnixNano())
+
+	message, attachments := extractAgentMessageAndAttachments(input)
+	if strings.TrimSpace(message) == "" && len(attachments) > 0 {
+		message = "请查看附件并回答。"
+	}
+	result["message"] = message
+	result["attachments"] = attachments
+	return result
+}
+
+func extractAgentMessageAndAttachments(input interface{}) (string, []interface{}) {
+	attachments := make([]interface{}, 0)
+	textParts := make([]string, 0)
+
+	appendText := func(text string) {
+		trimmed := strings.TrimSpace(text)
+		if trimmed != "" {
+			textParts = append(textParts, trimmed)
+		}
+	}
+
+	appendTextFile := func(fileName, mimeType, data string) {
+		decoded, ok := decodeBase64Text(data)
+		if !ok {
+			label := defaultString(fileName, "attachment")
+			appendText(fmt.Sprintf("[附件 %s 无法直接解码为文本，mime=%s]", label, mimeType))
+			return
+		}
+		label := defaultString(fileName, "attachment.txt")
+		appendText(fmt.Sprintf("[文件 %s]\n%s", label, decoded))
+	}
+
+	var walkContent func(content interface{})
+	walkContent = func(content interface{}) {
+		switch current := content.(type) {
+		case string:
+			appendText(current)
+		case []interface{}:
+			for _, item := range current {
+				walkContent(item)
+			}
+		case map[string]interface{}:
+			partType, _ := current["type"].(string)
+			switch partType {
+			case "input_text", "text":
+				if text, ok := current["text"].(string); ok {
+					appendText(text)
+				}
+			case "input_image":
+				if attachment, ok := buildImageAttachment(current); ok {
+					attachments = append(attachments, attachment)
+				}
+			case "input_file":
+				source, ok := current["source"].(map[string]interface{})
+				if !ok {
+					return
+				}
+				sourceType, _ := source["type"].(string)
+				if sourceType != "base64" {
+					return
+				}
+				mimeType, _ := source["media_type"].(string)
+				fileName, _ := source["filename"].(string)
+				data, _ := source["data"].(string)
+				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(mimeType)), "image/") {
+					attachment := map[string]interface{}{
+						"type":     "image",
+						"mimeType": mimeType,
+						"fileName": defaultString(fileName, "image-file"),
+						"content":  stripDataURLPrefix(data),
+					}
+					attachments = append(attachments, attachment)
+					return
+				}
+				appendTextFile(fileName, mimeType, data)
+			case "message":
+				if nested, ok := current["content"]; ok {
+					walkContent(nested)
+				}
+			default:
+				if nested, ok := current["content"]; ok {
+					walkContent(nested)
+					return
+				}
+				if text, ok := current["text"].(string); ok {
+					appendText(text)
+				}
+			}
+		default:
+			appendText(fmt.Sprintf("%v", current))
+		}
+	}
+
+	switch current := input.(type) {
+	case string:
+		appendText(current)
+	case map[string]interface{}:
+		if message, ok := current["message"].(string); ok {
+			appendText(message)
+		}
+		if text, ok := current["text"].(string); ok {
+			appendText(text)
+		}
+		if rawInput, ok := current["input"]; ok {
+			walkContent(rawInput)
+		}
+		if content, ok := current["content"]; ok {
+			walkContent(content)
+		}
+	case []interface{}:
+		walkContent(current)
+	default:
+		appendText(fmt.Sprintf("%v", current))
+	}
+
+	return strings.Join(textParts, "\n\n"), attachments
+}
+
+func buildImageAttachment(part map[string]interface{}) (map[string]interface{}, bool) {
+	source, ok := part["source"].(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	sourceType, _ := source["type"].(string)
+	if sourceType != "base64" {
+		return nil, false
+	}
+	mimeType, _ := source["media_type"].(string)
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(mimeType)), "image/") {
+		return nil, false
+	}
+	data, _ := source["data"].(string)
+	fileName, _ := source["filename"].(string)
+	return map[string]interface{}{
+		"type":     "image",
+		"mimeType": mimeType,
+		"fileName": defaultString(fileName, "image"),
+		"content":  stripDataURLPrefix(data),
+	}, true
+}
+
+// convertToGatewayParams converts Hub input format to Gateway format.
 func convertToGatewayParams(input interface{}) map[string]interface{} {
 	result := make(map[string]interface{})
 
 	inputMap, ok := input.(map[string]interface{})
 	if !ok {
-		// If not a map, just return as-is
 		if m, ok := input.(map[string]interface{}); ok {
 			return m
 		}
 		return result
 	}
 
-	// Convert "node" to nodeId + command if present
 	if node, ok := inputMap["node"].(string); ok {
 		parts := strings.SplitN(node, ".", 2)
 		if len(parts) >= 1 {
@@ -461,28 +483,23 @@ func convertToGatewayParams(input interface{}) map[string]interface{} {
 			result["command"] = parts[1]
 		}
 	}
-
-	// Preserve params as an object (do not flatten)
 	if params, ok := inputMap["params"].(map[string]interface{}); ok {
 		result["params"] = params
 	}
-
-	// Add idempotencyKey for the Gateway
-	result["idempotencyKey"] = fmt.Sprintf("invoke-%d", time.Now().UnixNano())
-
-	// Copy over any other fields that aren't node or params
+	if _, exists := inputMap["idempotencyKey"]; !exists {
+		result["idempotencyKey"] = fmt.Sprintf("invoke-%d", time.Now().UnixNano())
+	}
 	for k, v := range inputMap {
 		if k != "node" && k != "params" {
 			result[k] = v
 		}
 	}
-
 	return result
 }
 
 // readMatchingResponse reads WebSocket messages until it finds a response matching the given request ID.
-// It ignores event messages (like health events) that arrive before the actual response.
-func (c *GatewayClient) readMatchingResponse(gw *ws.Conn, requestID string) (interface{}, error) {
+// 这里必须忽略 health / tick 之类 event，不然会把事件误当成业务返回。
+func (c *GatewayClient) readMatchingResponse(gw *ws.Conn, requestID string) (map[string]interface{}, error) {
 	for {
 		_, rawMsg, err := gw.ReadMessage()
 		if err != nil {
@@ -498,43 +515,35 @@ func (c *GatewayClient) readMatchingResponse(gw *ws.Conn, requestID string) (int
 
 		msgType, _ := msg["type"].(string)
 		msgID, _ := msg["id"].(string)
-
-		// Skip event messages (like health) - they don't have matching id
 		if msgType == "event" {
 			fmt.Printf("[Gateway] readMatchingResponse skipping event: %v\n", msg["event"])
 			continue
 		}
-
-		// Check if this is a response for our request
 		if msgType == "res" && msgID == requestID {
-			// Check for error field
 			if errVal, hasError := msg["error"]; hasError && errVal != nil {
 				return nil, fmt.Errorf("gateway error: %v", errVal)
 			}
-
-			// Extract result
-			if result, hasResult := msg["result"]; hasResult {
-				return result, nil
-			}
-			// If no result field but no error, return the whole response
-			delete(msg, "type")
-			delete(msg, "id")
 			return msg, nil
 		}
-
-		// Not our response, keep reading
 		fmt.Printf("[Gateway] readMatchingResponse: got unexpected msg type=%s id=%s, continue\n", msgType, msgID)
 	}
 }
 
-// NormalizeNodeArtifacts extracts artifacts from node.invoke result
+func extractPayloadMap(frame map[string]interface{}) (map[string]interface{}, bool) {
+	if frame == nil {
+		return nil, false
+	}
+	payload, ok := frame["payload"].(map[string]interface{})
+	return payload, ok
+}
+
+// NormalizeNodeArtifacts extracts artifacts from node.invoke result.
 func (c *GatewayClient) NormalizeNodeArtifacts(result interface{}) (interface{}, []protocol.NormalizedArtifact) {
 	if result == nil {
 		fmt.Printf("[Gateway] NormalizeNodeArtifacts: result is nil\n")
 		return nil, nil
 	}
 
-	// Debug: print the raw result structure
 	resultJSON, _ := json.MarshalIndent(result, "", "  ")
 	fmt.Printf("[Gateway] NormalizeNodeArtifacts: result=%s\n", string(resultJSON))
 
@@ -543,41 +552,156 @@ func (c *GatewayClient) NormalizeNodeArtifacts(result interface{}) (interface{},
 		return result, nil
 	}
 
-	base64Str, ok := record["base64"].(string)
+	targetRecord := record
+	if payloadMap, ok := record["payload"].(map[string]interface{}); ok {
+		targetRecord = payloadMap
+	}
+
+	base64Str, ok := targetRecord["base64"].(string)
 	if !ok || base64Str == "" {
 		return result, nil
 	}
 
 	format := "bin"
-	if f, ok := record["format"].(string); ok {
+	if f, ok := targetRecord["format"].(string); ok {
 		format = f
 	}
 
 	mimeType := ""
-	if mt, ok := record["mimeType"].(string); ok && mt != "" {
+	if mt, ok := targetRecord["mimeType"].(string); ok && mt != "" {
 		mimeType = mt
 	} else {
 		mimeType = mimeTypeFromFormat(format)
 	}
 
-	// Remove base64 from result
-	delete(record, "base64")
+	delete(targetRecord, "base64")
 
 	kind := detectArtifactKind(mimeType)
 	ext := extFromFormat(format)
 	filename := "node-output." + ext
 
-	return record, []protocol.NormalizedArtifact{
-		{
-			Kind:          kind,
-			Filename:      filename,
-			MimeType:      mimeType,
-			ContentBase64: base64Str,
-			Meta: map[string]interface{}{
-				"format": format,
-			},
+	return record, []protocol.NormalizedArtifact{{
+		Kind:          kind,
+		Filename:      filename,
+		MimeType:      mimeType,
+		ContentBase64: base64Str,
+		Meta: map[string]interface{}{
+			"format": format,
 		},
+	}}
+}
+
+func (c *GatewayClient) getLatestHistorySeq(ctx context.Context, sessionKey string) (int, error) {
+	if sessionKey == "" {
+		return 0, nil
 	}
+	result, err := c.GetSessionHistory(ctx, sessionKey, map[string]interface{}{"limit": 5})
+	if err != nil {
+		return 0, err
+	}
+	historyMap, ok := result.(map[string]interface{})
+	if !ok {
+		return 0, fmt.Errorf("unexpected history response type: %T", result)
+	}
+	items, ok := historyMap["items"].([]interface{})
+	if !ok {
+		return 0, nil
+	}
+	latest := 0
+	for _, item := range items {
+		seq := extractHistorySeq(item)
+		if seq > latest {
+			latest = seq
+		}
+	}
+	return latest, nil
+}
+
+func (c *GatewayClient) buildAgentResultFromHistory(ctx context.Context, sessionKey string, baselineSeq int) (interface{}, error) {
+	history, err := c.GetSessionHistory(ctx, sessionKey, map[string]interface{}{"limit": 20})
+	if err != nil {
+		return nil, err
+	}
+	historyMap, ok := history.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected history response type: %T", history)
+	}
+	items, ok := historyMap["items"].([]interface{})
+	if !ok || len(items) == 0 {
+		return nil, fmt.Errorf("history result missing items")
+	}
+
+	var latestAssistant map[string]interface{}
+	latestSeq := 0
+	for _, item := range items {
+		record, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		role, _ := record["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		seq := extractHistorySeq(record)
+		if seq < baselineSeq {
+			continue
+		}
+		if latestAssistant == nil || seq >= latestSeq {
+			latestAssistant = record
+			latestSeq = seq
+		}
+	}
+	if latestAssistant == nil {
+		return nil, fmt.Errorf("no assistant entry found after seq=%d", baselineSeq)
+	}
+
+	text := extractAssistantText(latestAssistant)
+	payload := map[string]interface{}{
+		"payloads": []interface{}{map[string]interface{}{"text": text}},
+	}
+	if usage, ok := latestAssistant["usage"]; ok {
+		payload["meta"] = map[string]interface{}{"usage": usage}
+	}
+	return payload, nil
+}
+
+func extractHistorySeq(item interface{}) int {
+	record, ok := item.(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	meta, ok := record["__openclaw"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	seqFloat, ok := meta["seq"].(float64)
+	if !ok {
+		return 0
+	}
+	return int(seqFloat)
+}
+
+func extractAssistantText(record map[string]interface{}) string {
+	content, ok := record["content"].([]interface{})
+	if !ok {
+		return ""
+	}
+	texts := make([]string, 0)
+	for _, block := range content {
+		part, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := part["type"].(string)
+		if blockType != "text" {
+			continue
+		}
+		text, _ := part["text"].(string)
+		if strings.TrimSpace(text) != "" {
+			texts = append(texts, text)
+		}
+	}
+	return strings.Join(texts, "\n\n")
 }
 
 // Helper functions
@@ -643,7 +767,6 @@ func extFromFormat(format string) string {
 }
 
 func encodeURIComponent(s string) string {
-	// Simple encoding for session keys
 	result := ""
 	for _, c := range s {
 		switch {
@@ -654,4 +777,31 @@ func encodeURIComponent(s string) string {
 		}
 	}
 	return result
+}
+
+func stripDataURLPrefix(data string) string {
+	trimmed := strings.TrimSpace(data)
+	if idx := strings.Index(trimmed, ","); strings.HasPrefix(strings.ToLower(trimmed), "data:") && idx >= 0 {
+		return trimmed[idx+1:]
+	}
+	return trimmed
+}
+
+func decodeBase64Text(data string) (string, bool) {
+	raw := stripDataURLPrefix(data)
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(raw)
+	}
+	if err != nil || !utf8.Valid(decoded) {
+		return "", false
+	}
+	return string(decoded), true
+}
+
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }

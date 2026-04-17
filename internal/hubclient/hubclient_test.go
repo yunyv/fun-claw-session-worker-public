@@ -13,11 +13,11 @@ import (
 
 func TestHubClientOptions(t *testing.T) {
 	opts := HubClientOptions{
-		URL:      "ws://localhost:31880/ws",
-		Token:    "test-token",
-		WorkerID: "worker-1",
-		Hostname: "test-host",
-		Version:  "1.0.0",
+		URL:          "ws://localhost:31880/ws",
+		Token:        "test-token",
+		WorkerID:     "worker-1",
+		Hostname:     "test-host",
+		Version:      "1.0.0",
 		Capabilities: []string{"responses.create", "session.history.get"},
 		OnTaskAssigned: func(task *protocol.TaskAssignedPayload) error {
 			return nil
@@ -83,7 +83,7 @@ func TestHubResponseFrame_JSON(t *testing.T) {
 
 func TestTaskAssignedPayload_JSON(t *testing.T) {
 	payload := protocol.TaskAssignedPayload{
-		RequestID:           "req-123",
+		RequestID:          "req-123",
 		SessionID:          "session-1",
 		WorkerID:           "worker-1",
 		AdapterID:          "adapter-1",
@@ -136,7 +136,7 @@ func TestArtifactDescriptor(t *testing.T) {
 	desc := protocol.ArtifactDescriptor{
 		ArtifactID: "art-123",
 		Kind:       protocol.ArtifactKindImage,
-		Filename:    "screenshot.png",
+		Filename:   "screenshot.png",
 		MimeType:   "image/png",
 		SizeBytes:  1024,
 		SHA256:     "abc123",
@@ -238,6 +238,7 @@ func TestPendingMap(t *testing.T) {
 
 func TestConcurrentPendingAccess(t *testing.T) {
 	pending := make(map[string]chan *protocol.HubResponseFrame)
+	var mu sync.Mutex
 	var wg sync.WaitGroup
 
 	for i := 0; i < 100; i++ {
@@ -245,8 +246,11 @@ func TestConcurrentPendingAccess(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			ch := make(chan *protocol.HubResponseFrame, 1)
-			pending[string(rune(i))] = ch
-			delete(pending, string(rune(i)))
+			key := string(rune(id))
+			mu.Lock()
+			pending[key] = ch
+			delete(pending, key)
+			mu.Unlock()
 		}(i)
 	}
 
