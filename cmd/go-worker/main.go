@@ -22,7 +22,7 @@ var (
 	gatewayURL   = flag.String("gateway-url", "http://127.0.0.1:18789", "OpenClaw Gateway HTTP URL")
 	gatewayToken = flag.String("gateway-token", "", "OpenClaw Gateway auth token")
 	gatewayWsURL = flag.String("gateway-ws-url", "ws://127.0.0.1:18789", "OpenClaw Gateway WebSocket URL")
-	capabilities = flag.String("capabilities", "agent,session.history.get,node.invoke", "Worker capabilities")
+	capabilities = flag.String("capabilities", "responses.create,agent,session.history.get,node.invoke", "Worker capabilities")
 	hostname     = flag.String("hostname", "", "Worker hostname (defaults to OS hostname)")
 	version      = flag.String("version", "1.0.0", "Worker version")
 )
@@ -55,11 +55,11 @@ func main() {
 	// Create Hub client - use pointer to avoid closure capture issue
 	var hubClient *hubclient.HubClient
 	hubClient = hubclient.New(hubclient.HubClientOptions{
-		URL:      *hubURL,
-		Token:    *hubToken,
-		WorkerID: *workerID,
-		Hostname: *hostname,
-		Version:  *version,
+		URL:          *hubURL,
+		Token:        *hubToken,
+		WorkerID:     *workerID,
+		Hostname:     *hostname,
+		Version:      *version,
 		Capabilities: caps,
 		OnTaskAssigned: func(task *protocol.TaskAssignedPayload) error {
 			fmt.Printf("[Worker] Received task: request_id=%s, action=%s, session=%s\n",
@@ -205,7 +205,7 @@ func sendFailed(hub *hubclient.HubClient, requestID string, err error) error {
 
 func parseCapabilities(caps string) []string {
 	if caps == "" {
-		return []string{"agent", "session.history.get", "node.invoke"}
+		return []string{"responses.create", "agent", "session.history.get", "node.invoke"}
 	}
 	return strings.Split(caps, ",")
 }
