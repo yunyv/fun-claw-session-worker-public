@@ -88,7 +88,7 @@ func TestTaskAssignedPayload_JSON(t *testing.T) {
 		WorkerID:           "worker-1",
 		AdapterID:          "adapter-1",
 		OpenclawSessionKey: "openclaw:session-1",
-		Action:             protocol.TaskActionResponsesCreate,
+		Action:             protocol.TaskActionAgent,
 		Input:              map[string]string{"input": "hello"},
 		CreatedAt:          time.Now(),
 	}
@@ -106,8 +106,8 @@ func TestTaskAssignedPayload_JSON(t *testing.T) {
 	if decoded.RequestID != "req-123" {
 		t.Errorf("expected request_id=req-123, got %s", decoded.RequestID)
 	}
-	if decoded.Action != protocol.TaskActionResponsesCreate {
-		t.Errorf("expected action=responses.create, got %s", decoded.Action)
+	if decoded.Action != protocol.TaskActionAgent {
+		t.Errorf("expected action=agent, got %s", decoded.Action)
 	}
 }
 

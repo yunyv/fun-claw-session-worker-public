@@ -1,7 +1,6 @@
 package gatewayclient
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -41,40 +40,172 @@ func New(baseURL, token, wsURL string) *GatewayClient {
 	}
 }
 
-// CreateResponse calls POST /v1/responses on Gateway
-func (c *GatewayClient) CreateResponse(ctx context.Context, input interface{}, sessionKey string) (interface{}, error) {
-	fmt.Printf("[Gateway] CreateResponse called with sessionKey=%s\n", sessionKey)
+// CallAgent calls the agent method via WebSocket on Gateway
+func (c *GatewayClient) CallAgent(ctx context.Context, input interface{}, sessionKey string) (interface{}, error) {
+	fmt.Printf("[Gateway] CallAgent called with sessionKey=%s\n", sessionKey)
 
-	body, err := json.Marshal(input)
+	inputJSON, _ := json.MarshalIndent(input, "", "  ")
+	fmt.Printf("[Gateway] CallAgent input: %s\n", string(inputJSON))
+
+	dialCtx, cancel := context.WithTimeout(ctx, gatewayDialTimeout)
+	defer cancel()
+
+	gw, _, err := ws.DefaultDialer.DialContext(dialCtx, c.wsURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal input: %w", err)
+		return nil, fmt.Errorf("failed to dial gateway ws: %w", err)
 	}
+	defer gw.Close()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/responses", bytes.NewReader(body))
+	// Read first message - should be connect.challenge
+	_, rawMsg, err := gw.ReadMessage()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to read challenge: %w", err)
+	}
+	fmt.Printf("[Gateway] CallAgent first message: %s\n", string(rawMsg))
+
+	var challenge map[string]interface{}
+	if err := json.Unmarshal(rawMsg, &challenge); err != nil {
+		return nil, fmt.Errorf("failed to parse challenge: %w", err)
 	}
 
-	c.setHeaders(req, operatorWriteScope, "application/json", sessionKey)
+	// Handle connect.challenge
+	if challengeType, ok := challenge["type"].(string); ok && challengeType == "event" {
+		if event, ok := challenge["event"].(string); ok && event == "connect.challenge" {
+			fmt.Printf("[Gateway] Received connect.challenge\n")
 
-	resp, err := c.httpClient.Do(req)
+			connectResp := map[string]interface{}{
+				"type":   "req",
+				"id":     "connect-1",
+				"method": "connect",
+				"params": map[string]interface{}{
+					"minProtocol": 3,
+					"maxProtocol": 3,
+					"client": map[string]interface{}{
+						"id":       "cli",
+						"version":  "1.0.0",
+						"platform": "linux",
+						"mode":     "cli",
+					},
+					"role":   "operator",
+					"auth":   map[string]interface{}{"token": c.token},
+					"scopes": []string{"operator.read", "operator.write"},
+				},
+			}
+
+			fmt.Printf("[Gateway] Sending connect\n")
+			if err := gw.WriteJSON(connectResp); err != nil {
+				return nil, fmt.Errorf("failed to send connect: %w", err)
+			}
+
+			// Read response
+			_, rawMsg, err = gw.ReadMessage()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read connect response: %w", err)
+			}
+			fmt.Printf("[Gateway] Connect response: %s\n", string(rawMsg))
+
+			var resp map[string]interface{}
+			json.Unmarshal(rawMsg, &resp)
+
+			if ok, hasOK := resp["ok"].(bool); !hasOK || !ok {
+				errMsg := "connect failed"
+				if errVal, hasErr := resp["error"].(map[string]interface{}); hasErr {
+					if msg, hasMsg := errVal["message"].(string); hasMsg {
+						errMsg = msg
+					}
+				}
+				return nil, fmt.Errorf("[Gateway] %s", errMsg)
+			}
+			fmt.Printf("[Gateway] Connect succeeded!\n")
+		}
+	}
+
+	// Transform input to agent format
+	agentParams := transformToAgentParams(input, sessionKey)
+
+	// Now send the agent request
+	reqPayload := map[string]interface{}{
+		"type":   "req",
+		"id":     "agent-1",
+		"method": "agent",
+		"params": agentParams,
+	}
+
+	reqJSON, _ := json.MarshalIndent(reqPayload, "", "  ")
+	fmt.Printf("[Gateway] CallAgent sending: %s\n", string(reqJSON))
+
+	if err := gw.WriteJSON(reqPayload); err != nil {
+		return nil, fmt.Errorf("failed to send agent request: %w", err)
+	}
+
+	// Read response
+	_, rawMsg, err = gw.ReadMessage()
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
-	defer resp.Body.Close()
+	fmt.Printf("[Gateway] CallAgent raw response: %s\n", string(rawMsg))
 
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("OpenClaw /v1/responses failed: %d %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var result interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	// Parse as generic map to see actual structure
+	var rawResp map[string]interface{}
+	if err := json.Unmarshal(rawMsg, &rawResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	fmt.Printf("[Gateway] CreateResponse success\n")
+	// Check for error field
+	if errVal, hasError := rawResp["error"]; hasError && errVal != nil {
+		return nil, fmt.Errorf("agent error: %v", errVal)
+	}
+
+	// Extract result - could be in "result" field or directly in response
+	result, hasResult := rawResp["result"]
+	if !hasResult {
+		delete(rawResp, "error")
+		if len(rawResp) > 0 {
+			result = rawResp
+		} else {
+			result = nil
+		}
+	}
+
+	fmt.Printf("[Gateway] CallAgent result extracted: %v\n", result)
 	return result, nil
+}
+
+// transformToAgentParams transforms Hub input format to Gateway agent format
+func transformToAgentParams(input interface{}, sessionKey string) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	// Set sessionId if provided
+	if sessionKey != "" {
+		result["sessionId"] = sessionKey
+	}
+
+	// Generate idempotencyKey
+	result["idempotencyKey"] = fmt.Sprintf("agent-%d", time.Now().UnixNano())
+
+	// Initialize attachments as empty array
+	result["attachments"] = []interface{}{}
+
+	switch v := input.(type) {
+	case string:
+		result["message"] = v
+	case map[string]interface{}:
+		// Look for common message field names
+		if msg, ok := v["message"].(string); ok {
+			result["message"] = msg
+		} else if text, ok := v["text"].(string); ok {
+			result["message"] = text
+		} else if inp, ok := v["input"].(string); ok {
+			result["message"] = inp
+		} else {
+			// Pass through as message if it's a map
+			result["message"] = fmt.Sprintf("%v", v)
+		}
+	default:
+		result["message"] = fmt.Sprintf("%v", input)
+	}
+
+	return result
 }
 
 // GetSessionHistory calls GET /sessions/{sessionKey}/history on Gateway
@@ -272,8 +403,8 @@ func (c *GatewayClient) InvokeNode(ctx context.Context, input interface{}) (inte
 }
 
 // convertToGatewayParams converts Hub input format to Gateway format
-// Hub: {node: "canvas.snapshot", params: {arg1: "val1"}}
-// Gateway: {nodeId: "canvas", command: "snapshot", arg1: "val1"}
+// Hub: {node: "canvas.snapshot", params: {arg1: "val1"}, timeoutMs: 30}
+// Gateway: {nodeId: "canvas", command: "snapshot", params: {arg1: "val1"}, timeoutMs: 30}
 func convertToGatewayParams(input interface{}) map[string]interface{} {
 	result := make(map[string]interface{})
 
@@ -295,11 +426,9 @@ func convertToGatewayParams(input interface{}) map[string]interface{} {
 		}
 	}
 
-	// If there's a nested "params" object, flatten it to top level
+	// Preserve params as an object (do not flatten)
 	if params, ok := inputMap["params"].(map[string]interface{}); ok {
-		for k, v := range params {
-			result[k] = v
-		}
+		result["params"] = params
 	}
 
 	// Copy over any other fields that aren't node or params
@@ -373,7 +502,7 @@ func (c *GatewayClient) setHeaders(req *http.Request, scope, contentType, sessio
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 	if scope != "" {
-		req.Header.Set("X-OpenClaw-Scopes", scope)
+		req.Header.Set("x-openclaw-scopes", scope)
 	}
 	if sessionKey != "" {
 		req.Header.Set("X-OpenClaw-Session-Key", sessionKey)
@@ -382,7 +511,7 @@ func (c *GatewayClient) setHeaders(req *http.Request, scope, contentType, sessio
 
 func (c *GatewayClient) setReadHeaders(req *http.Request, sessionKey string) {
 	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("X-OpenClaw-Scopes", operatorReadScope)
+	req.Header.Set("x-openclaw-scopes", operatorReadScope)
 	if sessionKey != "" {
 		req.Header.Set("X-OpenClaw-Session-Key", sessionKey)
 	}

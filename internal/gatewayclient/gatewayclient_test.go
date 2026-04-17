@@ -4,54 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
-
-func TestCreateResponse_SendsOperatorWriteScopeAndSessionKey(t *testing.T) {
-	var seenAuth, seenScopes, seenSessionKey string
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenAuth = r.Header.Get("Authorization")
-		seenScopes = r.Header.Get("X-OpenClaw-Scopes")
-		seenSessionKey = r.Header.Get("X-OpenClaw-Session-Key")
-		_, _ = io.ReadAll(r.Body)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"output_text": "hello"})
-	}))
-	defer server.Close()
-
-	gw := New(server.URL, "gateway-secret", server.URL+"/ws")
-
-	result, err := gw.CreateResponse(
-		context.Background(),
-		map[string]interface{}{"model": "openclaw", "input": "hi", "stream": false},
-		"funclaw:conversation-123",
-	)
-
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	resultMap, ok := result.(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected map result, got %T", result)
-	}
-	if resultMap["output_text"] != "hello" {
-		t.Errorf("expected output_text=hello, got %v", resultMap["output_text"])
-	}
-	if seenAuth != "Bearer gateway-secret" {
-		t.Errorf("expected auth=Bearer gateway-secret, got %s", seenAuth)
-	}
-	if seenScopes != "operator.write" {
-		t.Errorf("expected scopes=operator.write, got %s", seenScopes)
-	}
-	if seenSessionKey != "funclaw:conversation-123" {
-		t.Errorf("expected sessionKey=funclaw:conversation-123, got %s", seenSessionKey)
-	}
-}
 
 func TestGetSessionHistory_SendsOperatorReadScope(t *testing.T) {
 	var seenAuth, seenScopes string
@@ -174,22 +130,6 @@ func TestEncodeURIComponent(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("encodeURIComponent(%q) = %q, want %q", tt.input, got, tt.expected)
 		}
-	}
-}
-
-func TestCreateResponse_ErrorHandling(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, `{"error": "internal error"}`)
-	}))
-	defer server.Close()
-
-	gw := New(server.URL, "token", server.URL)
-
-	_, err := gw.CreateResponse(context.Background(), map[string]string{"input": "hi"}, "")
-
-	if err == nil {
-		t.Error("expected error for non-200 response")
 	}
 }
 

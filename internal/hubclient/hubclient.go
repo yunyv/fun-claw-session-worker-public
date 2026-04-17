@@ -137,10 +137,47 @@ func (c *HubClient) RegisterArtifact(params protocol.ArtifactRegisterParams) (*p
 	if err != nil {
 		return nil, err
 	}
-	descriptor, ok := resp.(*protocol.ArtifactDescriptor)
+
+	// resp is a map[string]interface{} from JSON decoding, not *protocol.ArtifactDescriptor
+	respMap, ok := resp.(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("unexpected artifact.register response type: %T", resp)
 	}
+
+	// Build ArtifactDescriptor from map
+	descriptor := &protocol.ArtifactDescriptor{}
+
+	if id, ok := respMap["artifact_id"].(string); ok {
+		descriptor.ArtifactID = id
+	}
+	if kind, ok := respMap["kind"].(string); ok {
+		descriptor.Kind = protocol.ArtifactKind(kind)
+	}
+	if filename, ok := respMap["filename"].(string); ok {
+		descriptor.Filename = filename
+	}
+	if mimeType, ok := respMap["mime_type"].(string); ok {
+		descriptor.MimeType = mimeType
+	}
+	if sizeBytes, ok := respMap["size_bytes"].(float64); ok {
+		descriptor.SizeBytes = int(sizeBytes)
+	}
+	if sha256, ok := respMap["sha256"].(string); ok {
+		descriptor.SHA256 = sha256
+	}
+	if transport, ok := respMap["transport"].(string); ok {
+		descriptor.Transport = protocol.ArtifactTransport(transport)
+	}
+	if inlineBase64, ok := respMap["inline_base64"].(string); ok {
+		descriptor.InlineBase64 = &inlineBase64
+	}
+	if downloadURL, ok := respMap["download_url"].(string); ok {
+		descriptor.DownloadURL = &downloadURL
+	}
+	if meta, ok := respMap["meta"].(map[string]interface{}); ok {
+		descriptor.Meta = meta
+	}
+
 	return descriptor, nil
 }
 

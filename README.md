@@ -13,7 +13,7 @@ Go 实现的 Session Hub Worker，通过 WebSocket 连接 Hub 并将任务转发
 
 | Action | 说明 |
 |--------|------|
-| `responses.create` | 调用 Gateway 创建响应 |
+| `agent` | 调用 Gateway Agent 执行任务 |
 | `session.history.get` | 获取会话历史 |
 | `node.invoke` | 调用节点，支持 Artifacts 注册 |
 
@@ -45,7 +45,7 @@ go build -o bin/go-worker ./cmd/go-worker
 | `--gateway-url` | `http://127.0.0.1:18789` | OpenClaw Gateway HTTP 地址 |
 | `--gateway-token` | 空 | Gateway 认证 Token |
 | `--gateway-ws-url` | `ws://127.0.0.1:18789` | OpenClaw Gateway WebSocket 地址 |
-| `--capabilities` | `responses.create,session.history.get,node.invoke` | 支持的能力列表 |
+| `--capabilities` | `agent,session.history.get,node.invoke` | 支持的能力列表 |
 | `--version` | `1.0.0` | Worker 版本号 |
 
 ## 架构

@@ -22,7 +22,7 @@ var (
 	gatewayURL   = flag.String("gateway-url", "http://127.0.0.1:18789", "OpenClaw Gateway HTTP URL")
 	gatewayToken = flag.String("gateway-token", "", "OpenClaw Gateway auth token")
 	gatewayWsURL = flag.String("gateway-ws-url", "ws://127.0.0.1:18789", "OpenClaw Gateway WebSocket URL")
-	capabilities = flag.String("capabilities", "responses.create,session.history.get,node.invoke", "Worker capabilities")
+	capabilities = flag.String("capabilities", "agent,session.history.get,node.invoke", "Worker capabilities")
 	hostname     = flag.String("hostname", "", "Worker hostname (defaults to OS hostname)")
 	version      = flag.String("version", "1.0.0", "Worker version")
 )
@@ -101,18 +101,18 @@ func handleTask(hub *hubclient.HubClient, gateway *gatewayclient.GatewayClient, 
 	artifacts := []protocol.ArtifactDescriptor{}
 
 	switch task.Action {
-	case protocol.TaskActionResponsesCreate:
-		fmt.Printf("[Worker] Executing responses.create for request_id=%s\n", task.RequestID)
+	case protocol.TaskActionAgent:
+		fmt.Printf("[Worker] Executing agent for request_id=%s\n", task.RequestID)
 		// Debug: print input structure
 		inputJSON, _ := json.MarshalIndent(task.Input, "", "  ")
 		fmt.Printf("[Worker] DEBUG: input=%s\n", string(inputJSON))
-		res, err := gateway.CreateResponse(ctx, task.Input, task.OpenclawSessionKey)
+		res, err := gateway.CallAgent(ctx, task.Input, task.OpenclawSessionKey)
 		if err != nil {
-			fmt.Printf("[Worker] ERROR: responses.create failed: %v\n", err)
+			fmt.Printf("[Worker] ERROR: agent failed: %v\n", err)
 			return sendFailed(hub, task.RequestID, err)
 		}
 		result = res
-		fmt.Printf("[Worker] responses.create completed for request_id=%s\n", task.RequestID)
+		fmt.Printf("[Worker] agent completed for request_id=%s\n", task.RequestID)
 
 	case protocol.TaskActionSessionHistoryGet:
 		fmt.Printf("[Worker] Executing session.history.get for request_id=%s\n", task.RequestID)
@@ -192,7 +192,7 @@ func sendFailed(hub *hubclient.HubClient, requestID string, err error) error {
 
 func parseCapabilities(caps string) []string {
 	if caps == "" {
-		return []string{"responses.create", "session.history.get", "node.invoke"}
+		return []string{"agent", "session.history.get", "node.invoke"}
 	}
 	return strings.Split(caps, ",")
 }

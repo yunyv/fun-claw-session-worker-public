@@ -17,7 +17,7 @@ const (
 type TaskAction string
 
 const (
-	TaskActionResponsesCreate   TaskAction = "responses.create"
+	TaskActionAgent             TaskAction = "agent"
 	TaskActionSessionHistoryGet TaskAction = "session.history.get"
 	TaskActionNodeInvoke        TaskAction = "node.invoke"
 )
